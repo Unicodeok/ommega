@@ -755,7 +755,8 @@ async function refreshStrongboxKeybox(){
   var out = String(r.stdout || "");
   if (out.indexOf("SET") < 0){ setT(el, "sbkb.unset"); return; }
   var m = /DeviceID="([^"]+)"/.exec(out);
-  /* 用 setT 记下「键 + 变量」，切语言时 applyI18n 会按新语言重算；直接写 textContent 会停在旧语言。 */
+  /* 用 setT 记下「键 + 变量」，切语言时 applyI18n 会按新语言重算；
+     直接写 textContent 会停在旧语言，直到重开页面。 */
   if (m) setT(el, "sbkb.setId", { id: m[1] });
   else setT(el, "sbkb.set");
 }
