@@ -1121,7 +1121,7 @@ fn build_chain_signed_by(
     // KeyUsage：请求了 ATTEST_KEY（用途枚举值 7）的叶子必须带 keyCertSign ——
     // AIDL 里写得很死：「keyCertSignBit: iff the attested key has
     // KeyPurpose::ATTEST_KEY」。没带的话它就不像一张能签发子证书的证明密钥。
-    let is_attest_key = p.purposes.iter().any(|&purpose| purpose == 7);
+    let is_attest_key = p.purposes.contains(&7);
     let ku_der = {
         let mut d = Der::new();
         if is_attest_key {

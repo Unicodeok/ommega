@@ -1,12 +1,18 @@
 # 发版：编三端产物并挂到 GitHub Release 上。
 #
+# 产物一共五样：A 端 zip、B 端 zip、b-app 的 APK、服务端 Linux(musl) 二进制、
+# 服务端 Windows 二进制。以前后两样得在自己电脑上单独编，现在一起在这儿出。
+#
 # 为什么 A 端要拿 secret 里的 ASK：injector 用 `include_bytes!` 把本地兜底 SOTER 私钥
 # 编进二进制，而 `*.pem` 被 .gitignore 排除（私钥不进公开仓库）。CI 里只能用占位密钥
 # 让编译过，但**占位不能进发布包** —— 那会把用户设备上的兜底 ASK 换成一把没人认的钥匙。
 # 所以这里从 `secrets.SOTER_ASK_PEM`（base64）还原真实 PEM 再打包。
 #
+# b-app 的签名同理：debug.keystore 被 .gitignore 排除（里面有私钥），但从 secret
+# `B_APP_KEYSTORE_B64` 还原，保证每次发出来的 APK 签名一致，能覆盖升级。
+#
 # 手动触发：
-#   gh workflow run release.yml -f tag=v1.7.8
+#   gh workflow run release.yml -f tag=v1.7.9
 # 或 Actions 页面点 Run workflow。
 name: release
 
@@ -14,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "要挂产物的 release tag（必须已存在，比如 v1.7.8）"
+        description: "要挂产物的 release tag（必须已存在，比如 v1.7.9）"
         required: true
         type: string
 
@@ -46,7 +52,9 @@ jobs:
           set -euo pipefail
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+          # minimal profile 不含 Android target，要单独装；缺了会报
+          # `can't find crate for core`。四个 ABI 全列上，缺的那个 build.py 也会补。
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
 
       - name: 装 protoc
         if: matrix.name == 'a-side'
@@ -112,51 +120,169 @@ jobs:
         with:
           name: ${{ matrix.name }}-zip
           path: ${{ matrix.ws }}/target/ommega-*-release-*.zip
+          # A 端 zip 里夹着内置兜底 ASK，少留一份副本（公开仓库的 artifact
+          # 对登录用户可下，默认存 90 天）。
+          retention-days: 1
 
-  server:
+  b-app:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
+      - name: 装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # `yes | sdkmanager` 配上 `set -o pipefail` 会因为 yes 收到 SIGPIPE 而
+      # 整条管道返回非零（日志里那句 `yes: standard output: Broken pipe`），
+      # 把 `yes` 的退出码吃掉就行。许可在 runner 上本来就已经接受过。
+      - name: 装 Android SDK 平台
+        run: |
+          set -uo pipefail
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKM" ]; then
+            echo "runner 上没有 $SDKM" >&2
+            exit 1
+          fi
+          { yes 2>/dev/null || true; } | "$SDKM" --licenses >/dev/null 2>&1 || true
+          "$SDKM" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: 取 gradle 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('b-app/source/**/*.gradle*', 'b-app/source/gradle/libs.versions.toml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      # 签名密钥也走 secret：仓库里那份 debug.keystore 是被 .gitignore 挡住的。
+      # 少了它 AGP 会打出未签名的包，装不上。
+      - name: 还原签名密钥
+        working-directory: b-app/source
+        env:
+          KEYSTORE_B64: ${{ secrets.B_APP_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_B64:-}" ]; then
+            echo "缺少 secret B_APP_KEYSTORE_B64（base64 后的 debug.keystore）" >&2
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d > debug.keystore
+          keytool -list -keystore debug.keystore -storepass android | tail -2
+
+      - name: 编 APK
+        working-directory: b-app/source
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: b-app-apk
+          path: b-app/source/app/build/outputs/apk/release/app-release.apk
+          retention-days: 1
+
+  server:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            triple: x86_64-unknown-linux-musl
+            binary: relay_rs
+          - os: windows-latest
+            triple: ""
+            binary: relay_rs.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
       - name: 装工具链
+        shell: bash
         run: |
           set -euo pipefail
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-          rustup target add x86_64-unknown-linux-musl
+          if [ -n "${{ matrix.triple }}" ]; then
+            rustup target add "${{ matrix.triple }}"
+          fi
+
+      - name: 装 musl 工具链
+        if: matrix.triple != ''
+        run: |
+          set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends musl-tools
-      - name: 编 musl
+
+      - name: 取 cargo 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server/source/target
+          key: cargo-rel-${{ runner.os }}-server-${{ hashFiles('server/source/Cargo.lock') }}
+          restore-keys: |
+            cargo-rel-${{ runner.os }}-server-
+
+      - name: 编服务端
         working-directory: server/source
-        run: cargo build --release --target x86_64-unknown-linux-musl
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.triple }}" ]; then
+            cargo build --release --target "${{ matrix.triple }}"
+          else
+            cargo build --release
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
-          name: server-bin
-          path: server/source/target/x86_64-unknown-linux-musl/release/relay_rs
+          name: server-${{ matrix.binary }}
+          path: server/source/target/${{ matrix.triple != '' && format('{0}/', matrix.triple) || '' }}release/${{ matrix.binary }}
+          retention-days: 1
 
   publish:
-    needs: [build, server]
+    needs: [build, b-app, server]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
 
-      - name: 列一下产物
-        run: find dist -type f | sort
+      # 模块 zip 的默认文件名带构建时的短 hash（`-1.7.9-130bd97.zip`），而
+      # `update.json` 的 zipUrl 是固定名字。这里统一去掉 hash 再上传，省得每次
+      # 发完版还要手动改名、还得防着手抖留两份重复附件。
+      - name: 统一附件名
+        run: |
+          set -euo pipefail
+          for f in dist/a-side-zip/*.zip dist/b-side-zip/*.zip; do
+            [ -f "$f" ] || continue
+            out=$(basename "$f" | sed -E 's/-[0-9a-f]{7}\.zip$/.zip/')
+            mv "$f" "dist/$out"
+          done
+          mv dist/b-app-apk/app-release.apk dist/client-b-app-release.apk
+          find dist -maxdepth 1 -type f | sort
 
       # 用 gh 直接把附件挂到已有 release 上（同名附件会被替换）。
+      # `GH_REPO` 必需：这个 job 没 checkout，gh 否则会去猜当前目录属于哪个仓库，
+      # 报 `fatal: not a git repository`。
       - name: 上传到 release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          for f in dist/a-side-zip/*.zip; do
-            [ -f "$f" ] || continue
-            gh release upload "$TAG" "$f" --clobber
-          done
-          for f in dist/b-side-zip/*.zip; do
-            [ -f "$f" ] || continue
-            gh release upload "$TAG" "$f" --clobber
-          done
-          gh release upload "$TAG" dist/server-bin/relay_rs --clobber
+          gh release upload "$TAG" \
+            dist/ommega-a-release-*.zip \
+            dist/ommega-b-release-*.zip \
+            dist/client-b-app-release.apk \
+            dist/server-relay_rs/relay_rs \
+            dist/server-relay_rs.exe/relay_rs.exe \
+            --clobber

@@ -321,8 +321,19 @@ impl crate::KeyMintTa {
                     KeyPurpose::Sign => {
                         let algorithm = remote_sign_algorithm(key_chars, &params)?;
                         // 只有在 `NONEwithECDSA`（输入就是摘要）时才有「域宽」这回事。
+                        // 取不到曲线（老 keyblob 里没这个 tag）就退回不整理，别把整笔
+                        // 签名搅黄：真实的输入长度总比直接失败强。
                         let raw_digest_len = if algorithm.starts_with("NONEwithECDSA") {
-                            Some(ec_field_len(key_chars)?)
+                            match ec_field_len(key_chars) {
+                                Ok(len) => Some(len),
+                                Err(_) => {
+                                    warn!(
+                                        "remote NONEwithECDSA key has no usable curve; \
+                                         forwarding the digest unchanged"
+                                    );
+                                    None
+                                }
+                            }
                         } else {
                             None
                         };

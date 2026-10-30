@@ -86,16 +86,6 @@ static IDS: RwLock<Ids> = RwLock::new(Ids {
     soter: String::new(),
 });
 
-/// 只给单测留的路径解析（运行时不读文件）。
-#[cfg(test)]
-fn path() -> String {
-    std::env::var("OMMEGA_DEFAULT_DEVICE_FILE")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_PATH.to_string())
-}
-
 /// 某条链路当前的默认设备 id（空字符串 = 没指定，按负载挑）。
 pub fn get(chain: Chain) -> String {
     IDS.read()
@@ -317,11 +307,6 @@ mod tests {
         // 设 soter 也不动 keymint。
         assert_eq!(get(Chain::Keymint), "device-b-key");
 
-        // 落盘、重读：两条都还在。
-        let ids = read_file(&file);
-        assert_eq!(ids.keymint, "device-b-key");
-        assert_eq!(ids.soter, "device-b-sot");
-
         // 入口归一：keymint 的请求拿 keymint 那台，soter 的拿 soter 那台。
         let empty = serde_json::json!({ "challenge": "AA", "device_id": "" });
         assert_eq!(
@@ -350,7 +335,8 @@ mod tests {
         assert_eq!(get(Chain::Soter), "device-b-sot");
         assert_eq!(fill_in_body(Chain::Keymint, &empty)["device_id"], "");
 
-        let _ = std::fs::remove_dir_all(Path::new(&file).parent().unwrap());
+        // 改完只在内存里，不落盘（重启就回 .env 里那个值）。
+        assert!(read_file(&file).keymint.is_empty());
     }
 
     #[test]

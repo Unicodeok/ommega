@@ -110,7 +110,7 @@ pub fn aes_gcm_encrypt(plaintext: &[u8], key: &[u8]) -> Result<AesGcmEncryption,
         .as_slice()
         .try_into()
         .map_err(|_| Error::InvalidIvLength)?;
-    let out = crate::aes::gcm_encrypt_raw(key, &iv_arr, &[], plaintext)
+    let out = crate::aes::gcm_encrypt_raw(key, &iv_arr, &[], plaintext, 16)
         .map_err(|_| Error::EncryptionFailed)?;
     let split = plaintext.len();
     let (ciphertext, tag) = out.split_at(split);

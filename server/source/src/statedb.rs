@@ -41,8 +41,21 @@ const LEGACY_SLOTS: &str = "data/soter_slots.json";
 /// 最久没见到的那一条换出去（LRU，见 `add_owner`）。
 pub const OWNER_FAMILY_CAP: usize = 512;
 
-/// 会话表条数上限，跟 B 端 `SESSION_MAX_FILES` 一个口径。超了按「最久没用」淘汰。
-pub const SESSION_MAX: usize = 20_000;
+/// 会话表条数上限。超了按「最久没用」淘汰。
+///
+/// 2026-10-29 从 20_000 抬到 200_000：实测不到三天就撞满（审计类应用每次跑都
+/// 铸一大批 key），此时 LRU 会把**几小时前刚用过、A 端 keyblob 里还在引用**的
+/// 会话删掉，那些钥匙就永久废了（A 端签名时只能拿到 `no session`）。一条会话
+/// 6~8 KB，200_000 条 ≈ 1.2 GB，磁盘够；真要满也只能淘汰真闲置的，见
+/// [`SESSION_EVICT_MIN_IDLE_MS`]。
+pub const SESSION_MAX: usize = 200_000;
+
+/// 多久没被用过才允许被 LRU 淘汰。
+///
+/// 上限只决定「库里能放多少条」，但删谁必须有底线：正在被用的钥匙（A 端
+/// keyblob 里存着 alias、随时可能拿回来签名/解密）不能因为总量到顶就被当成
+/// 垃圾。所以只淘汰闲置超过这个时长的，比它新的宁可不删（宁可超上限）。
+pub const SESSION_EVICT_MIN_IDLE_MS: u64 = 3 * 24 * 60 * 60 * 1000;
 
 /// 启动时只把最近用过的这么多条会话装进内存。一条（链 + 私钥密文）实测 6~8 KB，
 /// 8000 条 ≈ 50 MB；没装进来的留在库里，取用时按 alias 单查一条（有索引）。
@@ -347,16 +360,22 @@ impl StateDb {
         )?)
     }
 
-    /// 会话表超过 `cap` 条就从最久没用的开始删（LRU，丢的永远是没人用的那批）。
-    /// 返回删了几条。
-    pub fn trim_sessions_lru(&self, cap: usize) -> Result<usize> {
+    /// 会话表超过 `cap` 条就从最久没用的开始删，但只删闲置超过 `min_idle_ms` 的。
+    /// 返回删了几条；如果全是活跃会话，返回 0（宁可超上限）。
+    pub fn trim_sessions_lru(&self, cap: usize, min_idle_ms: u64) -> Result<usize> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let idle_cutoff = now_ms.saturating_sub(min_idle_ms as i64);
         let conn = self.plain();
         Ok(conn.execute(
             "DELETE FROM sessions WHERE alias IN (
                  SELECT alias FROM sessions
+                 WHERE used_epoch_ms < ?2
                  ORDER BY used_epoch_ms ASC, created_epoch_ms ASC
                  LIMIT (SELECT max(0, count(*) - ?1) FROM sessions))",
-            params![cap as i64],
+            params![cap as i64, idle_cutoff],
         )?)
     }
 
@@ -854,8 +873,12 @@ mod tests {
             .collect();
         assert_eq!(hot, vec!["al5", "al4"]);
 
-        // 上限 3：把最久没用的 al1 / al2 挤掉，留最近用的
-        assert_eq!(db.trim_sessions_lru(3).unwrap(), 2);
+        // 上限 3：把最久没用的 al1 / al2 挤掉，留最近用的。
+        // 这里的「最后使用」都是 100..500ms（远古），肯定过了闲置下限。
+        assert_eq!(
+            db.trim_sessions_lru(3, SESSION_EVICT_MIN_IDLE_MS).unwrap(),
+            2
+        );
         let mut left: Vec<String> = db
             .load_sessions()
             .unwrap()
@@ -865,7 +888,42 @@ mod tests {
         left.sort();
         assert_eq!(left, vec!["al3", "al4", "al5"]);
         // 没超上限时一条不动
-        assert_eq!(db.trim_sessions_lru(10).unwrap(), 0);
+        assert_eq!(
+            db.trim_sessions_lru(10, SESSION_EVICT_MIN_IDLE_MS).unwrap(),
+            0
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 总量到顶也不能动「刚用过」的会话：A 端的 keyblob 里还存着这些 alias，
+    /// 删了就等于把那批钥匙作废（现场表现就是 `no session` → `no key`）。
+    #[test]
+    fn lru_trim_never_evicts_a_recently_used_session() {
+        let (db, dir) = tmp_db("lru-active");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        // 一条三小时前用过（活跃），两条四天前用过（真闲置）
+        db.upsert_session(
+            "active",
+            &row_at("c", "l", now - 3 * 3_600_000, now - 3 * 3_600_000),
+        )
+        .unwrap();
+        for (name, ago) in [("idle1", 4u64), ("idle2", 5u64)] {
+            let ms = now - ago * 24 * 3_600_000;
+            db.upsert_session(name, &row_at("c", "l", ms, ms)).unwrap();
+        }
+
+        // 上限 1：只删得掉闲置的那两条，活跃那条必须留着。
+        assert_eq!(
+            db.trim_sessions_lru(1, SESSION_EVICT_MIN_IDLE_MS).unwrap(),
+            2
+        );
+        let left = db.get_session_row("active").unwrap();
+        assert!(left.is_some(), "正在被用的会话不能被淘汰");
+        assert_eq!(db.session_count().unwrap(), 1);
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1179,7 +1237,8 @@ mod tests {
             .iter()
             .map(|(a, s)| (a.clone(), s.used_epoch_ms))
             .collect();
-        let removed = db.trim_sessions_lru(1_000).unwrap();
+        // 演练里要验的是 LRU 排序本身，所以把闲置下限放成 0（所有行都可淘汰）。
+        let removed = db.trim_sessions_lru(1_000, 0).unwrap();
         let after = db.load_sessions().unwrap();
         let kept: HashMap<String, u64> = after
             .iter()

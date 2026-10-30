@@ -612,7 +612,7 @@ pub async fn admin_generate_token(
         return json_err(StatusCode::BAD_REQUEST, "duration_seconds must be positive");
     }
     let kind = body.kind.clone().unwrap_or_default().to_ascii_lowercase();
-    if kind != "" && kind != "pair" && kind != "public" {
+    if !kind.is_empty() && kind != "pair" && kind != "public" {
         return json_err(
             StatusCode::BAD_REQUEST,
             "kind must be '', 'pair' or 'public'",
@@ -1343,6 +1343,8 @@ pub async fn admin_attest_policy_set(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
+    // 这几个解析函数回的是 axum Response，体积本来就大；换成 Box 得改一堆调用点。
+    #[allow(clippy::result_large_err)]
     fn parse(
         name: &str,
         token: Option<&String>,

@@ -288,7 +288,11 @@ impl OmmegaRsaUndigestSignOperation {
         let rsa_key = parse_key(&key)?;
         let key_len = rsa_key.size();
         let (left_pad, max_size) = match mode {
+            // 裸模幂（NoPadding）：输入最多一个模长，短的左边补 0。
             SignMode::NoPadding => (true, key_len),
+            // PKCS#1 v1.5 签名（DIGEST=NONE）：AOSP 先做 type-1 填充
+            // `00 01 FF…FF 00 || M` 再模幂。以前这里漏了填充、直接拿明文模幂，
+            // 出来的 256 字节签名用公钥验不过（KmProbe 的「NONEwithRSA」项）。
             SignMode::Pkcs1_1_5Padding(Digest::None) => {
                 (false, key_len - PKCS1_UNDIGESTED_SIGNATURE_PADDING_OVERHEAD)
             }
@@ -322,14 +326,28 @@ impl crypto::AccumulatingOperation for OmmegaRsaUndigestSignOperation {
     fn finish(self: Box<Self>) -> Result<Vec<u8>, Error> {
         let priv_key = parse_key(&self.key)?;
         let key_len = priv_key.size();
-        let input = if self.left_pad {
+        let em = if self.left_pad {
             zero_pad_left(&self.pending_input, self.max_size)?
         } else {
-            self.pending_input.clone()
+            // EMSA-PKCS1-v1_5（type 1）：00 || 01 || FF* || 00 || M，正好模长字节。
+            let msg = &self.pending_input;
+            // EM = 00 || 01 || PS(FF…) || 00 || M，PS 长度 = k - len(M) - 3。
+            let pad_len = key_len.checked_sub(msg.len() + 3).ok_or_else(|| {
+                km_err!(InvalidInputLength, "message too long for PKCS#1 v1.5 sign")
+            })?;
+            let mut em = vec_try![0; key_len]?;
+            em[1] = 0x01;
+            for b in em.iter_mut().skip(2).take(pad_len) {
+                *b = 0xff;
+            }
+            // pad_len 之后那一字节保 0，剩下的就是消息本身。
+            let msg_at = 2 + pad_len + 1;
+            em[msg_at..].copy_from_slice(msg);
+            em
         };
         let n = priv_key.n().clone();
         let d = priv_key.d().clone();
-        let m = rsa::BigUint::from_bytes_be(&input);
+        let m = rsa::BigUint::from_bytes_be(&em);
         let sig = m.modpow(&d, &n);
         let mut buf = vec_try![0; key_len]?;
         let sig_bytes = sig.to_bytes_be();
@@ -405,5 +423,53 @@ mod digest_tests {
             .to_public_key()
             .verify(Pss::new::<Sha1>(), &hashed, &sig)
             .unwrap_or_else(|e| panic!("SHA1withRSA/PSS 验签失败: {e:?}"));
+    }
+}
+
+/// KmProbe 那四项（NONEwithRSA / AES-192-GCM / 96 位 tag / CTR 完整 IV）的回归点。
+#[cfg(test)]
+mod undigest_padding_tests {
+    use super::*;
+    use crypto::AccumulatingOperation as _;
+
+    fn rsa_key() -> crypto::rsa::Key {
+        let mut rng = rand_core::OsRng;
+        let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        crypto::rsa::Key(key.to_pkcs1_der().unwrap().as_bytes().to_vec())
+    }
+
+    /// `NONEwithRSA`：签名必须是 PKCS#1 v1.5 type-1 填充后的模幂，
+    /// 把签名解回 EM 就能看到 `00 01 FF…FF 00 || M`。
+    #[test]
+    fn nonewithrsa_applies_pkcs1_type1_padding() {
+        let key = rsa_key();
+        let msg = b"kmprobe-nonewithrsa-0123456789abcdef";
+        let mut op = OmmegaRsaUndigestSignOperation::new(
+            key.clone(),
+            SignMode::Pkcs1_1_5Padding(Digest::None),
+        )
+        .unwrap();
+        op.update(msg).unwrap();
+        let sig = Box::new(op).finish().unwrap();
+
+        let priv_key = parse_key(&key).unwrap();
+        let n = priv_key.n();
+        let sig_int = rsa::BigUint::from_bytes_be(&sig);
+        let em = sig_int.modpow(priv_key.e(), n).to_bytes_be();
+        let k = priv_key.size();
+        let em = if em.len() < k {
+            let mut v = vec![0u8; k - em.len()];
+            v.extend_from_slice(&em);
+            v
+        } else {
+            em
+        };
+
+        assert_eq!(em[0], 0x00, "EM 首字节固定 0");
+        assert_eq!(em[1], 0x01, "type 1 填充块");
+        let ff_count = em[2..].iter().take_while(|b| **b == 0xff).count();
+        assert!(ff_count >= 8, "FF 至少 8 字节，实际 {ff_count}");
+        assert_eq!(em[2 + ff_count], 0x00, "填充结束的 0 分隔符");
+        assert_eq!(&em[2 + ff_count + 1..], msg, "后面是消息本体");
     }
 }

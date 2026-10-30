@@ -426,17 +426,26 @@ fn recover_mirror_state_with(
                 return Err(error);
             }
             Err(error) => {
-                poison_mirror_state(&mut state, pending.kind);
+                // The System keystore already applied this state change and answered its caller,
+                // so the update cannot be abandoned silently, but retrying a rejection is
+                // pointless - ommega answered with a definite business error and will answer the
+                // same way again. Drop this one event so the lane keeps draining: poisoning here
+                // used to fail-close every ommega route (SYSTEM_ERROR for all keystore2 methods)
+                // until the process restarted, which is never an acceptable trade for one event.
+                let lane = state.lane_mut(pending.kind);
+                lane.pending.pop_front();
+                lane.draining = false;
+                let remaining = state.pending_len();
                 drop(state);
-                warn!(
-                    "event=mirror replay sequence={} domain={} method={} failed: {:#}; preserving the in-memory event and blocking ommega routes",
+                log::error!(
+                    "event=mirror replay sequence={} domain={} method={} rejected: {:#}; dropping the queued update because the System keystore already applied it; pending={}",
                     pending.sequence,
                     pending.kind.label(),
                     method,
-                    error
+                    error,
+                    remaining
                 );
                 wake_mirror_recovery_worker();
-                return Err(error);
             }
         }
     }

@@ -183,9 +183,11 @@ impl crypto::EmittingOperation for OmmegaAesOperation {
                 }
             },
             crypto::aes::CipherMode::Ctr { nonce } => {
-                let mut nonce12 = [0u8; 12];
-                nonce12.copy_from_slice(&nonce[..12]);
-                out = ctr_transform_keyed_bytes(&self.key, &nonce12, &self.data)?;
+                // AOSP 把 CTM nonce 的**整 16 字节**当计数器初值（末 4 字节是
+                // 计数器本身，调用方给的 DEADBEEF 要原样参与运算）。以前这里只取
+                // 前 12 字节、把后 4 字节清零，密文跟原生复算对不上 —— KmProbe 的
+                // 「AES-256-CTR · 16 字节固定 IV」就是拿这个判的。
+                out = ctr_transform_keyed_bytes(&self.key, &nonce, &self.data)?;
             }
         }
         Ok(out)
@@ -194,9 +196,8 @@ impl crypto::EmittingOperation for OmmegaAesOperation {
 
 /// CTR-transform data with the given raw key bytes and 12-byte nonce. Uses AES-128,
 /// AES-192 or AES-256 based on key length.
-fn ctr_transform_keyed_bytes(key: &[u8], nonce: &[u8; 12], data: &[u8]) -> Result<Vec<u8>, Error> {
-    let mut iv = [0u8; 16];
-    iv[..12].copy_from_slice(nonce);
+fn ctr_transform_keyed_bytes(key: &[u8], nonce: &[u8; 16], data: &[u8]) -> Result<Vec<u8>, Error> {
+    let iv = *nonce;
     let mut ks = vec_try![0; data.len()]?;
     let apply = |out: &mut [u8]| -> Result<(), Error> {
         match key.len() {
@@ -312,14 +313,7 @@ impl crypto::EmittingOperation for OmmegaAesGcmEncryptOperation {
     }
 
     fn finish(self: Box<Self>) -> Result<Vec<u8>, Error> {
-        if self.tag_len != 16 {
-            return Err(km_err!(
-                InvalidArgument,
-                "only 16-byte GCM tags supported, requested {}",
-                self.tag_len
-            ));
-        }
-        gcm_encrypt(&self.key, &self.nonce, &self.aad, &self.data)
+        gcm_encrypt(&self.key, &self.nonce, &self.aad, &self.data, self.tag_len)
     }
 }
 
@@ -337,14 +331,7 @@ impl crypto::EmittingOperation for OmmegaAesGcmDecryptOperation {
     }
 
     fn finish(self: Box<Self>) -> Result<Vec<u8>, Error> {
-        if self.tag_len != 16 {
-            return Err(km_err!(
-                InvalidArgument,
-                "only 16-byte GCM tags supported, requested {}",
-                self.tag_len
-            ));
-        }
-        // The input is ciphertext || tag (16 bytes at the end).
+        // The input is ciphertext || tag (tag_len bytes at the end).
         if self.data.len() < self.tag_len {
             return Err(km_err!(InvalidTag, "ciphertext too short for tag"));
         }
@@ -360,8 +347,9 @@ fn gcm_encrypt(
     nonce: &[u8; 12],
     aad: &[u8],
     plaintext: &[u8],
+    tag_len: usize,
 ) -> Result<Vec<u8>, Error> {
-    gcm_encrypt_raw(key, nonce, aad, plaintext)
+    gcm_encrypt_raw(key, nonce, aad, plaintext, tag_len)
 }
 
 fn gcm_decrypt(
@@ -374,28 +362,65 @@ fn gcm_decrypt(
     gcm_decrypt_raw(key, nonce, aad, ciphertext, tag)
 }
 
-/// Public AES-GCM encrypt helper (used by `km`). Emits `ciphertext || 16-byte tag`.
+/// 按 (密钥长度, tag 长度) 分派到 `aes-gcm` 的对应实例。
+///
+/// ring 的 `AES_*_GCM` 只认 16 字节 tag、也没有 AES-192，所以这里整段换成
+/// `aes-gcm`：tag 12/13/14/15/16 都是 AOSP 允许的（`GCMParameterSpec(96, iv)`），
+/// 192 位密钥也是（AOSP 同时支持 128/192/256）。
+macro_rules! gcm_dispatch {
+    ($key:expr, $tag_len:expr, $op:ident, $nonce:expr, $aad:expr, $input:expr) => {{
+        use aes_gcm::aead::consts::{U12, U13, U14, U15, U16};
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::aes::{Aes128, Aes192, Aes256};
+        use aes_gcm::{AesGcm, Nonce};
+        macro_rules! run {
+            ($c:ty, $t:ty) => {{
+                // AesGcm<Cipher, NonceSize, TagSize>：nonce 固定 12，tag 长度走第三格。
+                let cipher = AesGcm::<$c, U12, $t>::new_from_slice($key)
+                    .map_err(|_| km_err!(UnknownError, "invalid GCM key"))?;
+                let nonce = Nonce::from_slice($nonce);
+                let payload = Payload {
+                    msg: $input,
+                    aad: $aad,
+                };
+                cipher
+                    .$op(nonce, payload)
+                    .map_err(|_| km_err!(VerificationFailed, "GCM operation failed"))
+            }};
+        }
+        match ($key.len(), $tag_len) {
+            (16, 12) => run!(Aes128, U12),
+            (16, 13) => run!(Aes128, U13),
+            (16, 14) => run!(Aes128, U14),
+            (16, 15) => run!(Aes128, U15),
+            (16, 16) => run!(Aes128, U16),
+            (24, 12) => run!(Aes192, U12),
+            (24, 13) => run!(Aes192, U13),
+            (24, 14) => run!(Aes192, U14),
+            (24, 15) => run!(Aes192, U15),
+            (24, 16) => run!(Aes192, U16),
+            (32, 12) => run!(Aes256, U12),
+            (32, 13) => run!(Aes256, U13),
+            (32, 14) => run!(Aes256, U14),
+            (32, 15) => run!(Aes256, U15),
+            (32, 16) => run!(Aes256, U16),
+            (len, tag) => Err(km_err!(
+                UnsupportedKeySize,
+                "AES-GCM key {len} bytes with {tag}-byte tag"
+            )),
+        }
+    }};
+}
+
+/// Public AES-GCM encrypt helper (used by `km`). Emits `ciphertext || tag`.
 pub(crate) fn gcm_encrypt_raw(
     key: &[u8],
     nonce: &[u8; 12],
     aad: &[u8],
     plaintext: &[u8],
+    tag_len: usize,
 ) -> Result<Vec<u8>, Error> {
-    let alg = gcm_alg(key.len())?;
-    let key = ring::aead::UnboundKey::new(alg, key)
-        .map_err(|_| km_err!(UnknownError, "invalid GCM key"))?;
-    let sealing = ring::aead::LessSafeKey::new(key);
-    let nonce = ring::aead::Nonce::assume_unique_for_key(*nonce);
-    let aad = ring::aead::Aad::from(aad);
-    let mut in_out = plaintext.to_vec();
-    sealing
-        .seal_in_place_separate_tag(nonce, aad, &mut in_out)
-        .map(|tag| {
-            let mut out = in_out;
-            out.extend_from_slice(tag.as_ref());
-            out
-        })
-        .map_err(|_| km_err!(VerificationFailed, "GCM encrypt failed"))
+    gcm_dispatch!(key, tag_len, encrypt, nonce, aad, plaintext)
 }
 
 /// Public AES-GCM decrypt helper (used by `km`). `ciphertext` and `tag` are separate.
@@ -406,25 +431,79 @@ pub(crate) fn gcm_decrypt_raw(
     ciphertext: &[u8],
     tag: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    let alg = gcm_alg(key.len())?;
-    let key = ring::aead::UnboundKey::new(alg, key)
-        .map_err(|_| km_err!(UnknownError, "invalid GCM key"))?;
-    let opening = ring::aead::LessSafeKey::new(key);
-    let nonce = ring::aead::Nonce::assume_unique_for_key(*nonce);
-    let aad = ring::aead::Aad::from(aad);
-    let mut in_out = ciphertext.to_vec();
-    in_out.extend_from_slice(tag);
-    opening
-        .open_in_place(nonce, aad, &mut in_out)
-        .map(|pt| pt.to_vec())
-        .map_err(|_| km_err!(VerificationFailed, "GCM decrypt failed"))
+    let mut input = vec_try![0; ciphertext.len() + tag.len()]?;
+    input[..ciphertext.len()].copy_from_slice(ciphertext);
+    input[ciphertext.len()..].copy_from_slice(tag);
+    gcm_dispatch!(key, tag.len(), decrypt, nonce, aad, &input)
 }
 
-fn gcm_alg(key_len: usize) -> Result<&'static ring::aead::Algorithm, Error> {
-    match key_len {
-        16 => Ok(&ring::aead::AES_128_GCM),
-        24 => Err(km_err!(UnknownError, "AES-192-GCM unsupported")),
-        32 => Ok(&ring::aead::AES_256_GCM),
-        _ => Err(km_err!(UnknownError, "invalid GCM key length")),
+/// KmProbe 的 GCM / CTR 项：192 位密钥、12~16 字节 tag、CTR 用完整 16 字节 IV。
+#[cfg(test)]
+mod kmprobe_regression_tests {
+    use super::*;
+
+    fn nonce() -> [u8; 12] {
+        let mut n = [0u8; 12];
+        for (i, b) in n.iter_mut().enumerate() {
+            *b = 0xa0u8.wrapping_add(i as u8);
+        }
+        n
+    }
+
+    /// AOSP 同时支持 128/192/256 位 AES-GCM，192 位以前被直接拒了。
+    #[test]
+    fn aes192_gcm_round_trips() {
+        let key = [0x11u8; 24];
+        let ct = gcm_encrypt_raw(&key, &nonce(), b"aad", b"kmprobe-gcm-0123456789", 16).unwrap();
+        assert_eq!(ct.len(), 22 + 16);
+        let pt = gcm_decrypt_raw(&key, &nonce(), b"aad", &ct[..22], &ct[22..]).unwrap();
+        assert_eq!(pt, b"kmprobe-gcm-0123456789");
+    }
+
+    /// `GCMParameterSpec(96, iv)`：tag 长度 12 字节也要能加解密，
+    /// 输出 = 明文长度 + 12。
+    #[test]
+    fn gcm_accepts_twelve_byte_tags() {
+        for tag_len in 12..=16usize {
+            let key = [0x22u8; 32];
+            let msg = b"kmprobe-gcm96";
+            let ct = gcm_encrypt_raw(&key, &nonce(), &[], msg, tag_len).unwrap();
+            assert_eq!(ct.len(), msg.len() + tag_len, "tag {tag_len}");
+            let split = ct.len() - tag_len;
+            let pt = gcm_decrypt_raw(&key, &nonce(), &[], &ct[..split], &ct[split..]).unwrap();
+            assert_eq!(pt, msg, "tag {tag_len}");
+        }
+    }
+
+    /// AES-CTR 的 16 字节 IV 要**整段**当计数器初值（末 4 字节非零也要参与），
+    /// 不能像以前那样把后 4 字节清零。
+    #[test]
+    fn ctr_uses_the_whole_sixteen_byte_iv() {
+        use ctr::cipher::{KeyIvInit as _, StreamCipher as _};
+        let key = [0x33u8; 32];
+        let mut iv = [0u8; 16];
+        iv[12] = 0xde;
+        iv[13] = 0xad;
+        iv[14] = 0xbe;
+        iv[15] = 0xef;
+        let mut plain = [0u8; 32];
+        for (i, b) in plain.iter_mut().enumerate() {
+            *b = 0x40u8.wrapping_add(i as u8);
+        }
+
+        let got = ctr_transform_keyed_bytes(&key, &iv, &plain).unwrap();
+
+        let mut reference = plain;
+        let mut cipher = Ctr128BE::<Aes256>::new_from_slices(&key, &iv).unwrap();
+        cipher.apply_keystream(&mut reference);
+        assert_eq!(got, reference, "必须跟「整 16 字节 IV」的复算一致");
+
+        // 反向对照：把后 4 字节清零的复算必须**不**相等。
+        let mut zeroed_iv = iv;
+        zeroed_iv[12..].fill(0);
+        let mut wrong = plain;
+        let mut cipher = Ctr128BE::<Aes256>::new_from_slices(&key, &zeroed_iv).unwrap();
+        cipher.apply_keystream(&mut wrong);
+        assert_ne!(got, wrong, "不能再踩「IV 后 4 字节清零」那个坑");
     }
 }

@@ -91,9 +91,9 @@ fn cache_slot(call: &SoterCall) -> Option<String> {
 }
 
 /// 缓存条目：原始答复字节 + 写入时刻。
-static READ_CACHE: std::sync::Mutex<
-    Option<std::collections::HashMap<String, (std::time::Instant, Vec<u8>)>>,
-> = std::sync::Mutex::new(None);
+type ReadCache =
+    std::sync::Mutex<Option<std::collections::HashMap<String, (std::time::Instant, Vec<u8>)>>>;
+static READ_CACHE: ReadCache = std::sync::Mutex::new(None);
 /// 只读答复在几秒内不会变；再长就会让「刚建的钥匙」看起来还不存在。
 const READ_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -274,9 +274,6 @@ fn lookup_in_table(table: &str, uid: u32) -> Option<String> {
 /// 当成 bin.mt.plus / com.tencent.mobileqq），整轮退回本地。
 ///
 /// `/data/misc/ommega/foreground` 那份副本也不再读，留给 daemon 用。
-
-/// 拼一个 JSON 字符串字面量。alias 里有 `&`、challenge 是十六进制，正常都不带引号，
-/// 但转发的东西不能靠「正常」活着，该转义的都转义 —— 拼坏了 daemon 那边直接拒收。
 fn push_json_string(out: &mut String, value: &str) {
     out.push('"');
     for c in value.chars() {

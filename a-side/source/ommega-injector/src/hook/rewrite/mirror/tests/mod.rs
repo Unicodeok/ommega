@@ -244,7 +244,7 @@ fn non_ok_system_reply_cancels_mirror_reservation() {
 }
 
 #[test]
-fn mirror_business_error_preserves_event_and_blocks_routes() {
+fn mirror_business_error_drops_event_and_keeps_routes_open() {
     let _guard = route_state_test_guard();
     reserve_mirror_update(MirrorStateKind::Maintenance)
         .expect("onUserRemoved should reserve")
@@ -258,30 +258,26 @@ fn mirror_business_error_preserves_event_and_blocks_routes() {
         })
         .expect("onUserRemoved should queue");
 
-    let error = recover_mirror_state_with(&mut |_| {
+    let mut replayed = 0;
+    recover_mirror_state_with(&mut |_| {
+        replayed += 1;
         Err(anyhow::Error::new(Status::new_service_specific_error(
             7, None,
         )))
     })
-    .expect_err("business error must stop automatic retry");
-    assert!(!ommega_unavailable_error(&error));
+    .expect("a business rejection must not fail-close the ommega routes");
+    assert_eq!(replayed, 1, "the rejected update is attempted exactly once");
 
     let state = MIRROR_RECOVERY_STATE
         .lock()
         .expect("mirror recovery state poisoned");
-    assert!(state.maintenance.poisoned);
-    assert_eq!(state.maintenance.pending.len(), 1);
-    assert_eq!(
-        state.maintenance.pending[0]
-            .event
-            .as_ref()
-            .expect("business failure should retain the event")
-            .method(),
-        "OnUserRemoved"
+    assert!(
+        !state.maintenance.poisoned,
+        "a definite business rejection must only drop its own event"
     );
-    assert!(state.next_worker_wait(Instant::now()).is_none());
+    assert!(state.maintenance.pending.is_empty());
     drop(state);
     assert!(!mirror_state_dirty(MirrorStateKind::Authorization));
-    assert!(mirror_state_dirty(MirrorStateKind::Maintenance));
-    assert!(ensure_mirror_state_recovered().is_err());
+    assert!(!mirror_state_dirty(MirrorStateKind::Maintenance));
+    assert!(ensure_mirror_state_recovered().is_ok());
 }

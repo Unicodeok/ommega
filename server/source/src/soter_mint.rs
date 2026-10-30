@@ -984,7 +984,7 @@ fn is_soter_cpu_id(text: &str) -> bool {
 
 /// 32 字符 hex 转 16 字节。真机 getDeviceId 出的是二进制，不是文本。
 fn hex_bytes(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     let bytes = text.as_bytes();
@@ -1246,7 +1246,7 @@ mod tests {
             .decode(ask["data"].as_str().expect("data is base64"))
             .expect("payload decodes");
         let (ask_document, ask_signature) = split_ask_payload(&raw).expect("ASK payload splits");
-        let ask_public = pem_of(&String::from_utf8(ask_document.to_vec()).expect("json is utf-8"));
+        let ask_public = pem_of(core::str::from_utf8(ask_document).expect("json is utf-8"));
 
         let attk = run(
             "self_signed",
@@ -1536,6 +1536,10 @@ mod tests {
         let device = "device-a-authdoc";
         let uid = 10373i64;
         let alias = "SoterAuthKeyPay";
+        // 先留一把“生成前”的 ASK 公钥：整套用例并行跑时，同一层的 ASK 可能被
+        // 别的用例顶掉重铸，导出一次跟导出两次看到的未必是同一把。不管怎么转，
+        // 只要信封能被这一层的其中一把验过，就说明它确实是这一层签的。
+        let ask_before = ask_pem(device, uid);
         assert_eq!(
             run(
                 "self_signed",
@@ -1569,7 +1573,8 @@ mod tests {
 
         // App 是先拿 ASK 公钥再验这个信封的 —— 验得过，AuthKey 这条链才算自洽
         assert!(
-            verifies(&ask_pem(device, uid), &document, &signature),
+            verifies(&ask_before, &document, &signature)
+                || verifies(&ask_pem(device, uid), &document, &signature),
             "the AuthKey document must verify with the ASK key"
         );
     }

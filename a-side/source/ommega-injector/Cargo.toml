@@ -19,8 +19,9 @@ nix = { version = "0.31.3", features = ["ptrace", "signal"] }
 lsplt-rs = "2.1.6"
 anyhow = "1.0.104"
 async-trait = "0.1.91"
-rsbinder = { version = "0.10.0", features = ["android_12_plus", "rpc"] }
+rsbinder = { path = "../vendor/rsbinder", features = ["android_12_plus", "rpc"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha2 = "0.11.0"
 # SOTER 的 ASK/AuthKey 签名是 RSA-PSS-SHA256；`rsa 0.9` 自带 sha2 / rand_core
 # 的 re-export，所以不额外引第二个版本，直接从 `rsa::sha2` 取。

@@ -536,7 +536,7 @@ mod tests {
     #[test]
     fn a_caller_package_decides_by_the_package_list() {
         let cfg = Config::default();
-        for real in ["com.tencent.mm", "com.tencent.mobileqq"] {
+        for real in ["com.tencent.mm", "com.eg.android.AlipayGphone"] {
             assert_eq!(
                 reason_with_caller(
                     &cfg,
@@ -598,7 +598,7 @@ mod tests {
         let cfg = Config::default();
         for pkg in [
             "com.tencent.mm,com.tencent.mm:tools",
-            "com.google.android.gms,com.google.android.gsf",
+            "com.tencent.mobileqq,com.tencent.mm",
             "a.b.c,com.eg.android.AlipayGphone",
         ] {
             assert_eq!(
@@ -619,33 +619,27 @@ mod tests {
         .is_some());
     }
 
-    /// 缺省名单里放进来来的那几类包名不要手滑删掉（漏一个就是一台真应用被内置料顶掉），
-    /// 同时把探测器/测试类的包挡在外面。
+    /// 缺省名单里就那几类真会走腾讯 SOTER 的包（微信、支付宝、电商/出行、银行、
+    /// SOTER 检测器），漏一个就是一台真应用被内置料顶掉。名单外的（含探测/测试类）
+    /// 一个都不能在里面。
     #[test]
     fn the_default_package_list_covers_the_known_real_apps() {
         let known = split_list(DEFAULT_REAL_APP_PACKAGES);
         for pkg in [
-            // 腾讯系
+            // 真走 SOTER 的两个
             "com.tencent.mm",
-            "com.tencent.mobileqq",
-            "com.tencent.tim",
-            "com.tencent.wework",
-            // 支付/银行
             "com.eg.android.AlipayGphone",
+            // 支付/银行
             "com.unionpay",
             "com.icbc",
             "cmb.pb",
-            "com.webank.wemoney",
             "com.jd.jrapp",
-            // 头部应用与运营商
-            "com.taobao.taobao",
-            "com.xunmeng.pinduoduo",
+            // 电商/出行
+            "com.jingdong.app.mall",
             "com.sankuai.meituan",
             "com.sdu.didi.psnger",
-            "com.sinovatech.unicom.ui",
-            // GMS/Play
-            "com.google.android.gms",
-            "com.android.vending",
+            // 检测器：它要拿真机 cpu_id 跟自己的 getDeviceId 对一遍
+            "com.andrealyz.soterchecker",
         ] {
             assert!(
                 known.iter().any(|name| name == pkg),
@@ -653,10 +647,17 @@ mod tests {
             );
         }
         // 抖音（含极速版）2026-10-04 按要求移出，别再手滑加回来。
-        for pulled in ["com.ss.android.ugc.aweme", "com.ss.android.ugc.aweme.lite"] {
+        for pulled in [
+            "com.ss.android.ugc.aweme",
+            "com.ss.android.ugc.aweme.lite",
+            // QQ / GMS 这些不走腾讯 SOTER 的也保持在外面。
+            "com.tencent.mobileqq",
+            "com.google.android.gms",
+            "com.android.vending",
+        ] {
             assert!(
                 !known.iter().any(|name| name == pulled),
-                "{pulled} 已按要求移出真应用名单"
+                "{pulled} 不在真应用名单里，别加回来"
             );
         }
         // 探测/测试类一个都不能在里面 —— 放进来就是把真机那个 cpu_id 递出去。

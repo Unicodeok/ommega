@@ -131,7 +131,19 @@ impl crypto::EmittingOperation for OmmegaDesOperation {
     fn update(&mut self, data: &[u8]) -> Result<Vec<u8>, Error> {
         // Buffer until a full block is available.
         self.pending.extend_from_slice(data);
-        let usable = self.pending.len() / BLOCK * BLOCK;
+        let mut usable = self.pending.len() / BLOCK * BLOCK;
+        // PKCS#7 解密：最后一块带着 padding，必须留到 finish 才能验，不能在 update
+        // 里提前吐出去 —— 否则 finish 拿到空 buffer，解填充直接报 empty block
+        // （KmProbe 的 DESede/CBC 就是这么挂的：doFinal(ct) 走 update + finish）。
+        if self.dir == crypto::SymmetricOperation::Decrypt
+            && matches!(
+                self.mode,
+                crypto::des::Mode::EcbPkcs7Padding | crypto::des::Mode::CbcPkcs7Padding { .. }
+            )
+            && usable >= BLOCK
+        {
+            usable -= BLOCK;
+        }
         let mut out = Vec::new();
         let pending_slice = self.pending[..usable].to_vec();
         self.run_cipher(&pending_slice, &mut out);
@@ -170,5 +182,53 @@ impl crypto::EmittingOperation for OmmegaDesOperation {
             }
         }
         Ok(out)
+    }
+}
+
+/// KmProbe 的 3DES 往返：`doFinal(ct)` 走的是 update(ct) + finish()，
+/// 解密时最后一块要留到 finish 才能验 PKCS#7 填充。
+#[cfg(test)]
+mod pkcs7_decrypt_tests {
+    use super::*;
+    use crypto::Des as _;
+
+    fn key() -> crypto::des::Key {
+        let mut raw = [0u8; 24];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = (0x11 + i) as u8;
+        }
+        crypto::des::Key(raw)
+    }
+
+    fn round_trip(mode: crypto::des::Mode) {
+        let plain = b"kmprobe-3des";
+        let ct = {
+            let mut op = OmmegaDes
+                .begin(key().into(), mode, crypto::SymmetricOperation::Encrypt)
+                .unwrap();
+            let mut ct = op.update(plain).unwrap();
+            ct.extend(op.finish().unwrap());
+            ct
+        };
+        assert!(!ct.is_empty() && ct.len() % crypto::des::BLOCK_SIZE == 0);
+
+        let mut dec = OmmegaDes
+            .begin(key().into(), mode, crypto::SymmetricOperation::Decrypt)
+            .unwrap();
+        let mut pt = dec.update(&ct).unwrap();
+        pt.extend(dec.finish().unwrap());
+        assert_eq!(pt, plain, "3DES 往返必须还原原文");
+    }
+
+    #[test]
+    fn cbc_pkcs7_decrypts_in_one_update() {
+        round_trip(crypto::des::Mode::CbcPkcs7Padding {
+            nonce: [9, 8, 7, 6, 5, 4, 3, 2],
+        });
+    }
+
+    #[test]
+    fn ecb_pkcs7_decrypts_in_one_update() {
+        round_trip(crypto::des::Mode::EcbPkcs7Padding);
     }
 }

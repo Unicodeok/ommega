@@ -312,6 +312,20 @@ impl AuthorizationManager {
         if auth_token.userId == 0 {
             error!("Auth token has zero GK SID, indicating an authenticator problem");
         }
+        if auth_token.userId == 0 && auth_token.authenticatorId == 0 {
+            // The platform tolerates an identity-less token here: keystore2 only logs the zero GK
+            // SID and carries on with its bookkeeping. system_server does send such a token from
+            // its AddAuthToken path, so rejecting it (as SYSTEM_ERROR) would break the caller and,
+            // before the mirror stops poisoning its lane, fail-close every routed ommega call until
+            // keystore2 restarts. Follow the platform: warn and drop the token.
+            log::warn!(
+                "ignoring auth token without a secure user id or authenticator id: challengeTag={:04x} authType={:#x} timestamp={}ms",
+                challenge_tag(auth_token.challenge),
+                auth_token.authenticatorType.0,
+                auth_token.timestamp.milliSeconds,
+            );
+            return Ok(());
+        }
 
         validate_auth_token_shape(auth_token)?;
         if should_skip_system_auth_token_verification(ctx) {
@@ -394,14 +408,18 @@ fn check_ommega_keystore_permission(
 }
 
 fn validate_auth_token_shape(auth_token: &HardwareAuthToken) -> Result<()> {
+    // Identity-less tokens come from unlock paths where the framework never escrowed a
+    // GK SID for the user (observed after a screen-off/screen-on cycle: challenge=0,
+    // userId=0, authId=0, authType=NONE). There is no MAC the TA could verify and no
+    // authenticator the policy could enforce, and the platform only logs a warning, so
+    // accept the shape here; `add_auth_token` skips such a token before any verification.
+    if auth_token.userId == 0 && auth_token.authenticatorId == 0 {
+        return Ok(());
+    }
+
     if auth_token.mac.len() != AUTH_TOKEN_MAC_LEN {
         return Err(Error::Rc(ResponseCode::SYSTEM_ERROR))
             .context(ks_err!("invalid auth token MAC length"));
-    }
-
-    if auth_token.userId == 0 && auth_token.authenticatorId == 0 {
-        return Err(Error::Rc(ResponseCode::SYSTEM_ERROR))
-            .context(ks_err!("auth token has no secure user id"));
     }
 
     let auth_type = auth_token.authenticatorType.0;
@@ -1029,5 +1047,53 @@ impl IAuthorizationService for AuthorizationManager {
         let sid = SecureUserId(secure_user_id);
         self.get_last_auth_time(sid, auth_types)
             .map_err(into_logged_binder)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::android::hardware::security::secureclock::Timestamp::Timestamp;
+
+    fn token(user_id: i64, auth_id: i64, auth_type: i32, mac_len: usize) -> HardwareAuthToken {
+        HardwareAuthToken {
+            challenge: 0,
+            userId: user_id,
+            authenticatorId: auth_id,
+            authenticatorType: HardwareAuthenticatorType(auth_type),
+            timestamp: Timestamp { milliSeconds: 0 },
+            mac: vec![0u8; mac_len],
+        }
+    }
+
+    #[test]
+    fn identity_less_token_no_longer_fails_shape_validation() {
+        // system_server sends an all-zero token on some unlock paths; the platform
+        // tolerates it and rejecting it used to poison the injector's mirror lane.
+        let zero = token(0, 0, HardwareAuthenticatorType::NONE.0, AUTH_TOKEN_MAC_LEN);
+        validate_auth_token_shape(&zero).expect("identity-less token must be accepted");
+    }
+
+    #[test]
+    fn token_with_short_mac_is_still_rejected() {
+        let short = token(1000, 42, HardwareAuthenticatorType::FINGERPRINT.0, 8);
+        assert!(validate_auth_token_shape(&short).is_err());
+    }
+
+    #[test]
+    fn token_with_unknown_authenticator_type_is_still_rejected() {
+        let unknown = token(1000, 42, 0x40, AUTH_TOKEN_MAC_LEN);
+        assert!(validate_auth_token_shape(&unknown).is_err());
+    }
+
+    #[test]
+    fn token_with_none_authenticator_type_is_still_rejected() {
+        let none = token(
+            1000,
+            42,
+            HardwareAuthenticatorType::NONE.0,
+            AUTH_TOKEN_MAC_LEN,
+        );
+        assert!(validate_auth_token_shape(&none).is_err());
     }
 }

@@ -1,7 +1,7 @@
 [package]
 name = "ommega"
 authors = ["jiyin004"]
-version = "1.7.8"
+version = "1.7.11"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
@@ -27,7 +27,7 @@ prost-types = "0.14.4"
 hex = "0.4.3"
 log4rs = "1.4.0"
 log = "0.4.33"
-rsbinder = { version = "0.10.0", features = ["android_12_plus", "rpc"] }
+rsbinder = { path = "vendor/rsbinder", features = ["android_12_plus", "rpc"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 anyhow = "1.0.104"
 async-trait = "0.1.91"
@@ -82,11 +82,10 @@ members = [
 ]
 
 [patch.crates-io]
-# rsbinder 只改一处：nullable 的存在标记。AOSP 是“非 0 即存在”（Java
-# `readInt() != 0`、C++ `readInt32() != 0`），上游只认 1，于是同一个请求把标记换
-# 成 2 / -1 / INT_MAX 就在我们这边解析失败、被当陌生流量转发出去（KEY_NOT_FOUND），
-# 检测器一测一个准。改动在 vendor/rsbinder/src/{parcelable,macros}.rs。
-rsbinder = { path = "vendor/rsbinder" }
+# rsbinder 用 vendor/rsbinder 这份带补丁的副本：依赖里直接写 path，不靠 [patch.crates-io]。
+# （以前写成 patch，而且那行被注释吞掉了，结果 injector 一直链的是 crates.io 原版。）
+# 补丁改的是 AIDL parcelable 的存在标记：AOSP 只判 != 0，上游只认 1。
+# 改动点在 vendor/rsbinder/src/{parcelable,macros}.rs。
 kmr-derive = { path = "derive" }
 kmr-common = { path = "common" }
 kmr-crypto-ommega = { path = "crypto" }

@@ -368,7 +368,16 @@ hold() {
   if [ -z "$pid" ]; then
     take_over && return 0
   fi
-  if [ "$(hal_state)" = "running" ] || ! service_present; then
+  # HIDL 平台上原厂 HAL 必须一直留着（take_over 里 stop_stock=0），hal_state 恒为
+  # running，拿它当「被抢回去」的判据等于每轮都空跑一次 take_over：MEIZU 20 Pro
+  # （391QYGDJ2244E）实测 53 分钟写了 236 次，把日志冲得没法看。这种机器只看
+  # 我们的 AIDL 名字还在不在。
+  if soter_hal_is_hidl; then
+    if ! service_present; then
+      log "our AIDL name vanished; re-taking over"
+      take_over && return 0
+    fi
+  elif [ "$(hal_state)" = "running" ] || ! service_present; then
     log "stock HAL came back or our service vanished; re-taking over"
     take_over && return 0
   fi

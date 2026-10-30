@@ -343,6 +343,29 @@ mod session_cache_tests {
         assert!(!sessions.contains_key("k0"), "最久没用过的那个被换出去");
     }
 
+    /// 同一个 alias 在两套 HAL 上各是一把钥匙：另一个 HAL 铸的会话不能当本次结果。
+    #[test]
+    fn session_from_another_hal_is_not_reused() {
+        let _guard = exclusive();
+        let tee = session(7);
+        let mut strongbox = session(9);
+        strongbox.hal_service = SYSTEM_KEYMINT_STRONGBOX;
+        assert_eq!(
+            reusable_session(Some(tee.clone()), SYSTEM_KEYMINT_DEFAULT).map(|s| s.key_blob),
+            Some(vec![7]),
+            "同一个 HAL 的会话照旧复用"
+        );
+        assert!(
+            reusable_session(Some(tee), SYSTEM_KEYMINT_STRONGBOX).is_none(),
+            "TEE 的会话不能被当成 StrongBox 的"
+        );
+        assert_eq!(
+            reusable_session(Some(strongbox), SYSTEM_KEYMINT_STRONGBOX).map(|s| s.key_blob),
+            Some(vec![9])
+        );
+        assert!(reusable_session(None, SYSTEM_KEYMINT_DEFAULT).is_none());
+    }
+
     /// 命中内存时位置刷新、写库节流：刚用过的不用再写，隔够久了才写一次。
     #[test]
     fn cache_hits_refresh_recency_but_throttle_the_db_write() {
@@ -492,6 +515,15 @@ pub fn generate_attest_key(
     generate_attest_key_on(SYSTEM_KEYMINT_DEFAULT, alias, challenge, app_id_der, spec)
 }
 
+/// 存着的会话能不能当本次的现成结果。
+///
+/// 同一个 alias 在 TEE 和 StrongBox 上是两把不同的钥匙：拿另一个 HAL 铸的会话当结果，
+/// 等于把 TEE 的链当 StrongBox 交给调用方，key blob 本身也不通用（签名会
+/// `INVALID_KEY_BLOB`）。所以只复用同一个 HAL 的。
+fn reusable_session(existing: Option<TeeSession>, service: &str) -> Option<TeeSession> {
+    existing.filter(|session| session.hal_service == service)
+}
+
 /// Serialize check -> generate -> publish per alias, never across HAL services
 /// or unrelated aliases. Weak entries keep completed flights from retaining locks.
 #[derive(Default)]
@@ -547,7 +579,9 @@ pub fn generate_attest_key_on(
     static FLIGHTS: OnceLock<AliasFlights> = OnceLock::new();
     let session = FLIGHTS.get_or_init(AliasFlights::default).get_or_generate(
         alias,
-        || session_get(alias).ok(),
+        // 同一个 alias 在 TEE 和 StrongBox 上是两把不同的钥匙：存着的会话如果来自另一个
+        // HAL，拿它当本次结果就是把 TEE 链当 StrongBox 交给调用方。只复用同一个 HAL 的。
+        || reusable_session(session_get(alias).ok(), service),
         || mint_attest_key_on(service, challenge, app_id_der, spec),
         |session| session_put(alias, session.clone()),
     )?;
@@ -660,8 +694,7 @@ fn mint_attest_key_with(
     // 委派时 HAL 只回子证书（AIDL: "the returned certificate chain must contain
     // only an attestation certificate signed with the specified key"），
     // 父链由本端补上——A 端要靠它校验签发关系，校验完只把子证书交给调用方。
-    if parent.is_some() {
-        let parent = parent.as_ref().expect("checked above");
+    if let Some(parent) = parent.as_ref() {
         append_issuer_chain(&mut cert_chain, &parent.cert_chain)?;
     }
 

@@ -400,33 +400,35 @@ impl crate::KeyMintTa {
         // 调用方自带的证明密钥（App AttestKey 委派）：只有当它在本端是 `Remote`
         // （私钥在 B 端真 TEE）时，才改由 B 的原生 KeyMint 用它签发子证书；
         // 如果那是一把本地签发密钥（私钥在本机），仍旧走本地路径。
-        let remote_issuer = if attestation_key.is_some()
-            && get_opt_tag_value!(params, AttestationChallenge)?.is_some()
-            && self.dev.remote.as_ref().is_some_and(|r| r.enabled())
-        {
-            let info = attestation_key.as_ref().unwrap();
-            let (blob, _) = self.keyblob_parse_decrypt(&info.key_blob, &info.attest_key_params)?;
-            blob.suitable_for(KeyPurpose::AttestKey, self.hw_info.security_level)?;
-            if info.issuer_subject_name.is_empty() {
-                return Err(km_err!(InvalidArgument, "empty subject name"));
+        let wants_attest_challenge = get_opt_tag_value!(params, AttestationChallenge)?.is_some();
+        let remote_issuer = match attestation_key.as_ref() {
+            Some(info)
+                if wants_attest_challenge
+                    && self.dev.remote.as_ref().is_some_and(|r| r.enabled()) =>
+            {
+                let (blob, _) =
+                    self.keyblob_parse_decrypt(&info.key_blob, &info.attest_key_params)?;
+                blob.suitable_for(KeyPurpose::AttestKey, self.hw_info.security_level)?;
+                if info.issuer_subject_name.is_empty() {
+                    return Err(km_err!(InvalidArgument, "empty subject name"));
+                }
+                match blob.key_material {
+                    KeyMaterial::Remote(remote) => Some(device::RemoteAttestationKey {
+                        alias: remote.alias,
+                        public_key: remote.public_key,
+                        issuer_subject_name: info.issuer_subject_name.clone(),
+                    }),
+                    _ => None,
+                }
             }
-            match blob.key_material {
-                KeyMaterial::Remote(remote) => Some(device::RemoteAttestationKey {
-                    alias: remote.alias,
-                    public_key: remote.public_key,
-                    issuer_subject_name: info.issuer_subject_name.clone(),
-                }),
-                _ => None,
-            }
-        } else {
-            None
+            _ => None,
         };
         // 认证绑定的 key 仍旧本地生成：B 端拿不到 A 的 auth token，远端铸出来也签不了
         // （begin(SIGN) 必然 -26），而丢掉 504/505 又会让叶子与请求对不上。
         // 认证密钥（PURPOSE_ATTEST_KEY）则改走远端：B 用调用方那把 ATTEST_KEY
         // 原生签发子证书，不再需要本机拿它的私钥签 TBS（真机实测：独占 ATTEST_KEY
         // 可铸，用它 begin(SIGN) 恒被拒）。
-        let remote_attest = get_opt_tag_value!(params, AttestationChallenge)?.is_some()
+        let remote_attest = wants_attest_challenge
             && !requests_user_auth(params)
             && self.dev.remote.as_ref().is_some_and(|r| r.enabled())
             && (attestation_key.is_none() || remote_issuer.is_some());

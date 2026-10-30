@@ -610,13 +610,27 @@ impl TaskStore {
                 // 500ms 刷一次完全够用，省下的锁时间留给 complete_task 那头。
                 let heartbeat_due = {
                     let now = Self::now_ms();
-                    self.online_seen
-                        .read()
-                        .map(|m| {
-                            m.get(device_id)
-                                .is_none_or(|ts| now.saturating_sub(*ts) >= 500)
-                        })
-                        .unwrap_or(true)
+                    // 能力改口的那一轮不节流：B 端刚说“不支持了 / 签不了了”要立刻生效，
+                    // 否则接下来 500ms 还会按旧结论派活（单测里连续两次 online 也会卡在这）。
+                    let caps_changed = inner.devices.get(device_id).is_some_and(|d| {
+                        let diff = |incoming: Option<bool>, known: Option<bool>| {
+                            incoming.is_some_and(|v| Some(v) != known)
+                        };
+                        diff(caps.soter, d.supports_soter)
+                            || diff(caps.soter_sign, d.soter_sign)
+                            || diff(caps.soter_nosign, d.soter_nosign)
+                            || diff(caps.soter_stuck, d.soter_stuck)
+                            || diff(caps.strongbox, d.supports_strongbox)
+                    });
+                    caps_changed
+                        || self
+                            .online_seen
+                            .read()
+                            .map(|m| {
+                                m.get(device_id)
+                                    .is_none_or(|ts| now.saturating_sub(*ts) >= 500)
+                            })
+                            .unwrap_or(true)
                 };
                 if heartbeat_due {
                     // Register the device as connected.  Carrying the previous
@@ -1816,6 +1830,8 @@ mod soter_substitute_tests {
     fn healthy_caps() -> DeviceCaps {
         DeviceCaps {
             soter: Some(true),
+            // 签名类 op 只派给「真签出来过一次」的设备（见 resolve_soter_target）。
+            soter_sign: Some(true),
             ..DeviceCaps::default()
         }
     }
@@ -1881,7 +1897,16 @@ mod soter_substitute_tests {
     async fn generate_export_init_keep_the_offline_named_target_despite_load() {
         let store = TaskStore::new(30, 60, 100, 60, false);
         for id in ["a", "b"] {
-            online(&store, id, DeviceCaps::default()).await;
+            online(
+                &store,
+                id,
+                DeviceCaps {
+                    soter: Some(true),
+                    soter_sign: Some(true),
+                    ..DeviceCaps::default()
+                },
+            )
+            .await;
         }
         let chosen = store.resolve_soter_target("missing", false).await.unwrap();
         for op in [
@@ -1952,7 +1977,7 @@ mod soter_substitute_tests {
     async fn mapped_offline_can_switch_and_named_recovery_always_wins() {
         let store = TaskStore::new(30, 60, 100, 60, false);
         for id in ["a", "b"] {
-            online(&store, id, DeviceCaps::default()).await;
+            online(&store, id, healthy_caps()).await;
         }
         let first = store.resolve_soter_target("named", false).await.unwrap();
         offline(&store, &first).await;
@@ -2281,7 +2306,9 @@ mod selfcheck_tests {
             store.resolve_soter_target("dev", false).await.as_deref(),
             Some("dev")
         );
-        // 没上报过的（老版本 relay）签名还是能试。
+        // 没上报过的（老版本 relay）签名还是能试 —— 指“没说不支持”，但真派签名活
+        // 还是要它 `soter_sign == Some(true)`：没量过的机器先当不能签（见
+        // `resolve_soter_target` 的过滤）。
         let unknown = TaskStore::new(30, 60, 100, 60, false);
         assert!(unknown
             .pop_for_b(
@@ -2293,9 +2320,10 @@ mod selfcheck_tests {
             .await
             .is_none());
         assert_eq!(
-            unknown.resolve_soter_target("", true).await.as_deref(),
+            unknown.resolve_soter_target("", false).await.as_deref(),
             Some("dev")
         );
+        assert_eq!(unknown.resolve_soter_target("", true).await, None);
     }
 
     /// SOTER 点名在线设备不换身份，只有离线/未指定才按能力回退。
@@ -2684,6 +2712,8 @@ mod dequeue_regression_tests {
                 "M",
                 DeviceCaps {
                     soter: Some(true),
+                    // 签名类的替身也得是真签得出来的那台。
+                    soter_sign: Some(true),
                     ..Default::default()
                 },
                 Duration::ZERO,

@@ -60,10 +60,10 @@ fn service_name() -> String {
 /// 回复的字节完全可控，没有 libbinder 自己的异常包装夹在中间。拿来对「真机 HAL 回的
 /// 长什么样」和「我们回的有没有对上」最直接。
 pub fn probe(service: &str, code: u32) -> anyhow::Result<String> {
-    use rsbinder::{Parcel, Transactable};
+    use rsbinder::Parcel;
     rsbinder::ProcessState::init("/dev/binder", 15)
         .map_err(|error| anyhow::anyhow!("binder init failed: {error}"))?;
-    let binder = rsbinder::hub::get_service(service)
+    let binder = rsbinder::hub::check_service(service)
         .ok_or_else(|| anyhow::anyhow!("service {service} not found"))?;
     let descriptor = descriptor_of(service);
     let mut data = Parcel::new();
@@ -114,33 +114,56 @@ const INTERFACE_TRANSACTION: u32 = 0x5f4e_5446;
 /// `hasAskAlready` 在 4 槽里是 9、连号里是 7，而且都只带一个 int（4 字节）。
 /// 于是第一次见到它就定下布局并缓存，之后把连号的号换算成 4 槽的规范号，
 /// 后续所有逻辑只用一套写法。
-static LAYOUT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static LAYOUTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u8>>> =
+    std::sync::OnceLock::new();
 const LAYOUT_UNKNOWN: u8 = 0;
 const LAYOUT_14: u8 = 1;
 const LAYOUT_11: u8 = 2;
 
-fn note_layout(code: u32, avail: usize) {
-    use std::sync::atomic::Ordering;
-    if LAYOUT.load(Ordering::Relaxed) != LAYOUT_UNKNOWN {
+/// 调用方是谁（`/proc/<pid>/cmdline` 的第一段）。拿不到就给空串，那些调用共用
+/// 一个匿名槽位，行为跟以前的全局判定一样。
+fn caller_key() -> String {
+    let pid = rsbinder::get_calling_pid();
+    if pid <= 0 {
+        return String::new();
+    }
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return String::new();
+    };
+    let name = raw.split(|byte| *byte == 0).next().unwrap_or_default();
+    String::from_utf8_lossy(name).into_owned()
+}
+
+fn layout_slot(caller: &str) -> u8 {
+    let map = LAYOUTS.get_or_init(Default::default);
+    let guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.get(caller).copied().unwrap_or(LAYOUT_UNKNOWN)
+}
+
+/// 布局按**调用方**分开记，不能全局一个值：同一台机器上 soterserver 和第三方检测器
+/// 可能用不同版本的 ISoter 号表（4 槽 vs 1–11 连号），定成一个值会让后到的那个
+/// 客户端全程调到错的方法上。MEIZU 20 Pro（391QYGDJ2244E）实测：SoterChecker 走连号
+/// （7 = hasAskAlready），被按 4 槽解释成 generateAuthKeyPair，于是它读到
+/// hasAsk=false、generate 记 -20、export 记 -5，五项全红。
+fn note_layout(caller: &str, code: u32, avail: usize) {
+    if layout_slot(caller) != LAYOUT_UNKNOWN {
         return;
     }
-    match (code, avail) {
+    let layout = match (code, avail) {
         // hasAskAlready / generateAskKeyPair：两种排布里都只带一个 int，号却不同。
-        (9, 4) | (5, 4) => {
-            LAYOUT.store(LAYOUT_14, Ordering::Relaxed);
-        }
-        (7, 4) | (4, 4) => {
-            LAYOUT.store(LAYOUT_11, Ordering::Relaxed);
-        }
-        _ => {}
-    }
+        (9, 4) | (5, 4) => LAYOUT_14,
+        (7, 4) | (4, 4) => LAYOUT_11,
+        _ => return,
+    };
+    let map = LAYOUTS.get_or_init(Default::default);
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.insert(caller.to_string(), layout);
 }
 
 /// 把任意排布的号码换成 4 槽的规范号（后面的逻辑只认这套）。
-fn canonical_code(code: u32, avail: usize) -> u32 {
-    use std::sync::atomic::Ordering;
-    note_layout(code, avail);
-    if LAYOUT.load(Ordering::Relaxed) != LAYOUT_11 {
+fn canonical_code(caller: &str, code: u32, avail: usize) -> u32 {
+    note_layout(caller, code, avail);
+    if layout_slot(caller) != LAYOUT_11 {
         return code;
     }
     match code {
@@ -289,8 +312,10 @@ impl Remotable for SoterTa {
         // 错位 4 字节（soterserver 把方法返回值当 status、把非空标记当返回值，
         // exportAsk 的 exportData 就解不出来，Duck/微信卡在 askModel）。
         reply.write_i32(0)?;
-        // 号码先归一到「4 槽规范号」：不同设备的排布不一样（见 LAYOUT）。
-        let code = canonical_code(code, reader.data_avail());
+        // 号码先归一到「4 槽规范号」：不同设备的排布不一样，同一台上不同客户端
+        // 也可能不一样（见 note_layout），所以按调用方各自记。
+        let caller = caller_key();
+        let code = canonical_code(&caller, code, reader.data_avail());
         // 先按 AIDL 定义把入参读干净：读错位的话后面拿到的 uid/alias 全是垃圾。
         let mut uid = None;
         let mut alias = None;
@@ -466,4 +491,33 @@ pub fn serve(driver: &str) -> anyhow::Result<()> {
     // 注册完就得有人处理事务：主线程进 binder 事件循环（rsbinder 的 join_thread_pool）
     rsbinder::ProcessState::join_thread_pool()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// 布局按调用方分开记：同一台机器上两个客户端用不同号表时互不干扰。
+    ///
+    /// 以前是全局一个 AtomicU8，先到的 soterserver 把布局定成 4 槽，后到的
+    /// SoterChecker 走连号就全程调到错的方法上（MEIZU 20 Pro 实测五项全红）。
+    #[test]
+    fn layouts_are_tracked_per_caller() {
+        // 4 槽那套：hasAskAlready 是 9，号表原样不动。
+        assert_eq!(canonical_code("/test/4slot", 9, 4), 9);
+        assert_eq!(canonical_code("/test/4slot", 5, 4), 5);
+        // 连号那套：7 = hasAskAlready、9 = initSign，换算成 4 槽的 9 / 11。
+        assert_eq!(canonical_code("/test/11slot", 7, 4), 9);
+        assert_eq!(canonical_code("/test/11slot", 9, 4), 11);
+        // 两个调用方互不覆盖：先记下的 4 槽不会被后到的连号改掉。
+        assert_eq!(canonical_code("/test/4slot", 5, 4), 5);
+        assert_eq!(canonical_code("/test/11slot", 5, 4), 7);
+    }
+
+    /// 头一次就判不出来的调用方保持未知（号表原样），量一次号表也不会写脏。
+    #[test]
+    fn unknown_layout_keeps_the_raw_code() {
+        assert_eq!(canonical_code("/test/unknown", 13, 4), 13);
+        assert_eq!(layout_slot("/test/unknown"), LAYOUT_UNKNOWN);
+    }
 }

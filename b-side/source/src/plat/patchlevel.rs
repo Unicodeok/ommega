@@ -92,9 +92,12 @@ static KNOWN_SERVICE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 /// 为什么要记：跟完之后属性会一直是 A 的值，本机所有应用看到的系统版本/补丁日期
 /// 都变成别人的。所以每笔出完链必须自己回原值 —— 用这份基线，而不是「上一笔的值」：
 /// 上一笔可能已经是 A 的，拿它当基线就永远回不去了。
-static BASELINE: OnceLock<Mutex<Option<Vec<(String, String)>>>> = OnceLock::new();
+/// 三个补丁相关属性的名字 -> 原始值。
+type Baseline = Vec<(String, String)>;
 
-fn baseline_slot() -> &'static Mutex<Option<Vec<(String, String)>>> {
+static BASELINE: OnceLock<Mutex<Option<Baseline>>> = OnceLock::new();
+
+fn baseline_slot() -> &'static Mutex<Option<Baseline>> {
     BASELINE.get_or_init(|| Mutex::new(None))
 }
 

@@ -8,13 +8,9 @@
 
 use base64::Engine;
 use chrono::Utc;
-use ecdsa::signature::Signer;
 use p256::ecdsa::{DerSignature as P256DerSignature, Signature as P256Signature};
 use p384::ecdsa::{DerSignature as P384DerSignature, Signature as P384Signature};
 use p521::ecdsa::{DerSignature as P521DerSignature, Signature as P521Signature};
-use rsa::pkcs1v15::SigningKey as RsaSigningKey;
-use rsa::signature::SignatureEncoding;
-use rsa::traits::Decryptor;
 use rsa::RsaPrivateKey;
 use serde_json::{json, Value};
 use sha1::Sha1;
@@ -48,6 +44,9 @@ const SESSION_TOUCH_MIN_MS: u64 = 5 * 60 * 1000;
 const PURGE_INTERVAL_MS: u64 = 60 * 1000;
 
 static LAST_PURGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 「超上限但没东西可删」这条告警上次打的时间，用来自助限频。
+static SESSION_CAP_REPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Where server_keybox sessions (leaf private key + chain) are persisted so a
 /// relay restart does not orphan the A-side's `KeyMaterial::Remote` keys.
@@ -253,10 +252,27 @@ impl Fulfill {
             Err(e) => tracing::warn!("sessions: 库里清过期会话失败：{e:#}"),
         }
         let cap = crate::statedb::SESSION_MAX;
-        match self.state.trim_sessions_lru(cap) {
+        match self
+            .state
+            .trim_sessions_lru(cap, crate::statedb::SESSION_EVICT_MIN_IDLE_MS)
+        {
             Ok(0) => {}
-            Ok(n) => tracing::info!("sessions: 库里按 LRU 淘汰 {n} 条（上限 {cap}）"),
+            Ok(n) => tracing::info!(
+                "sessions: 库里按 LRU 淘汰 {n} 条闲置会话（上限 {cap}，只动闲置超 3 天的）"
+            ),
             Err(e) => tracing::warn!("sessions: 库里按 LRU 淘汰失败：{e:#}"),
+        }
+        // 超上限但全是活跃会话时，上一行是 0 —— 得能看出来现在到底多少条。
+        // 隔一小时才报一次，不刷屏。
+        if let Ok(count) = self.state.session_count() {
+            if count > cap
+                && now_ms.saturating_sub(SESSION_CAP_REPORTED.swap(now_ms, Ordering::Relaxed))
+                    > 3_600_000
+            {
+                tracing::warn!(
+                    "sessions: 库里有 {count} 条会话，超过上限 {cap}，但没有可淘汰的闲置会话（宁可超限也不动在用的）"
+                );
+            }
         }
     }
 
@@ -1145,12 +1161,38 @@ impl Fulfill {
                 .collect::<String>()
         );
         // The A-side sends the bytes to sign in `data` (base64).
-        let data = body
+        let Some(data) = body
             .get("data")
             .and_then(Value::as_str)
-            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())?;
-        let key = s.leaf_key().ok()?;
-        let sig = sign_data(&key, &data).ok()?;
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+        else {
+            return Some(json!({ "error": "server_keybox sign: missing or bad base64 data" }));
+        };
+        let algorithm = body
+            .get("algorithm")
+            .and_then(Value::as_str)
+            .unwrap_or("SHA256withECDSA");
+        let key = match s.leaf_key() {
+            Ok(key) => key,
+            Err(e) => {
+                return Some(json!({
+                    "error": format!("server_keybox sign: unusable leaf key: {e}")
+                }))
+            }
+        };
+        // session 在（上面已命中），这里失败就不能再当「本层不适用」：一降级到设备层
+        // 只会拿到 `no key for alias`，把真正的原因（算法不支持 / 填充对不上）盖掉。
+        let sig = match sign_data(&key, &data, algorithm) {
+            Ok(sig) => sig,
+            Err(e) => {
+                tracing::warn!(
+                    "try_handle_sign: alias={alias} algorithm={algorithm} failed: {e:#}"
+                );
+                return Some(json!({
+                    "error": format!("server_keybox sign failed for {algorithm}: {e:#}")
+                }));
+            }
+        };
         let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig);
         // A-side reads `signature` first, then falls back to `data`; the B-side
         // returns `data`. Emit both so either consumer is satisfied.
@@ -1167,13 +1209,38 @@ impl Fulfill {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        // 没 session 才是真的「本层不管」，交给下一层。
         let s = self.get_session(&alias)?;
-        let data = body
+        let Some(data) = body
             .get("data")
             .and_then(Value::as_str)
-            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())?;
-        let key = s.leaf_key().ok()?;
-        let plain = decrypt_data(&key, &data).ok()?;
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+        else {
+            return Some(json!({ "error": "server_keybox decrypt: missing or bad base64 data" }));
+        };
+        let algorithm = body
+            .get("algorithm")
+            .and_then(Value::as_str)
+            .unwrap_or("RSA/OAEP/SHA-256/MGF1-SHA1");
+        let key = match s.leaf_key() {
+            Ok(key) => key,
+            Err(e) => {
+                return Some(json!({
+                    "error": format!("server_keybox decrypt: unusable leaf key: {e}")
+                }))
+            }
+        };
+        let plain = match decrypt_data(&key, &data, algorithm) {
+            Ok(plain) => plain,
+            Err(e) => {
+                tracing::warn!(
+                    "try_handle_decrypt: alias={alias} algorithm={algorithm} failed: {e:#}"
+                );
+                return Some(json!({
+                    "error": format!("server_keybox decrypt failed for {algorithm}: {e:#}")
+                }));
+            }
+        };
         let plain_b64 = base64::engine::general_purpose::STANDARD.encode(plain);
         // A-side reads `data` for decrypt (same field the B-side returns).
         Some(json!({
@@ -1305,56 +1372,216 @@ fn parse_leaf_key(pem_data: &str) -> anyhow::Result<LeafKey> {
     }
 }
 
-fn sign_data(key: &LeafKey, data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    match key {
-        LeafKey::Ec(cert::EcKey::P224(sk)) => {
-            let signing_key = p224::ecdsa::SigningKey::from(sk);
-            let sig: p224::ecdsa::Signature = signing_key.sign(data);
-            let der_sig = p224::ecdsa::DerSignature::from(sig);
-            Ok(der_sig.as_bytes().to_vec())
-        }
-        LeafKey::Ec(cert::EcKey::P256(sk)) => {
-            let signing_key = p256::ecdsa::SigningKey::from(sk);
-            let sig: P256Signature = signing_key.sign(data);
-            let der_sig = P256DerSignature::from(sig);
-            Ok(der_sig.as_bytes().to_vec())
-        }
-        LeafKey::Ec(cert::EcKey::P384(sk)) => {
-            let signing_key = p384::ecdsa::SigningKey::from(ecdsa::SigningKey::from(sk));
-            let sig: P384Signature = signing_key.sign(data);
-            let der_sig = P384DerSignature::from(sig);
-            Ok(der_sig.as_bytes().to_vec())
-        }
-        LeafKey::Ec(cert::EcKey::P521(sk)) => {
-            let signing_key = p521::ecdsa::SigningKey::from(ecdsa::SigningKey::from(sk));
-            let sig: P521Signature = signing_key.sign(data);
-            let der_sig = P521DerSignature::from(sig);
-            Ok(der_sig.as_bytes().to_vec())
-        }
-        LeafKey::Rsa(rk) => {
-            let rk = rk.as_ref();
-            let signing_key = RsaSigningKey::<Sha256>::new(rk.clone());
-            Ok(signing_key.sign(data).to_vec())
+/// A 端转发过来的 `algorithm` 串里带的摘要。
+///
+/// 服务端这几条密钥是给 remote 模式兜底的，必须按**请求的真实算法**签/解：
+/// `NONEwithECDSA` 的输入本身就是摘要（再哈希一层验签必挂），`SHA384withRSA`
+/// 的 DigestInfo 前缀也跟 SHA-256 不一样。以前这里一律按曲线默认摘要算，
+/// 于是 `NONEwithECDSA` 与任何非 SHA-256 的请求都静默算错。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeafDigest {
+    None,
+    Sha1,
+    Sha224,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl LeafDigest {
+    fn from_algorithm(algorithm: &str) -> LeafDigest {
+        let up = algorithm.to_ascii_uppercase();
+        if up.contains("NONE") {
+            LeafDigest::None
+        } else if up.contains("SHA1") || up.contains("SHA-1") {
+            LeafDigest::Sha1
+        } else if up.contains("SHA224") || up.contains("SHA-224") {
+            LeafDigest::Sha224
+        } else if up.contains("SHA384") || up.contains("SHA-384") {
+            LeafDigest::Sha384
+        } else if up.contains("SHA512") || up.contains("SHA-512") {
+            LeafDigest::Sha512
+        } else {
+            LeafDigest::Sha256
         }
     }
 }
 
-fn decrypt_data(key: &LeafKey, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+fn hash_with(digest: LeafDigest, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use sha2::Digest as _;
+    Ok(match digest {
+        LeafDigest::None => data.to_vec(),
+        LeafDigest::Sha1 => Sha1::digest(data).to_vec(),
+        LeafDigest::Sha224 => sha2::Sha224::digest(data).to_vec(),
+        LeafDigest::Sha256 => Sha256::digest(data).to_vec(),
+        LeafDigest::Sha384 => sha2::Sha384::digest(data).to_vec(),
+        LeafDigest::Sha512 => sha2::Sha512::digest(data).to_vec(),
+    })
+}
+
+/// 按请求的算法签名。EC 一律走 `sign_prehash`（`NONE` 直接签摘要，其余先按请求
+/// 摘要哈希一遍再签），RSA 的 PKCS#1/PSS 也跟着摘要走。
+fn sign_data(key: &LeafKey, data: &[u8], algorithm: &str) -> anyhow::Result<Vec<u8>> {
+    use ecdsa::signature::hazmat::PrehashSigner as _;
+    let digest = LeafDigest::from_algorithm(algorithm);
+    let up = algorithm.to_ascii_uppercase();
     match key {
-        LeafKey::Rsa(rk) => {
-            let rk = rk.as_ref();
-            // Try SHA-256 MGF1 first (standard OAEP).
-            let decrypting_sha256 = rsa::oaep::DecryptingKey::<Sha256>::new(rk.clone());
-            if let Ok(out) = decrypting_sha256.decrypt(data) {
-                return Ok(out);
-            }
-            // Try SHA-1 MGF1 (matches Java's OAEPWithSHA-256AndMGF1Padding).
-            let decrypting_sha1 = rsa::oaep::DecryptingKey::<Sha256, Sha1>::new(rk.clone());
-            decrypting_sha1
-                .decrypt(data)
-                .map_err(|e| anyhow::anyhow!("rsa oaep decrypt failed (SHA-256 + SHA-1 MGF1): {e}"))
+        LeafKey::Ec(cert::EcKey::P224(sk)) => {
+            let z = hash_with(digest, data)?;
+            let signing_key = p224::ecdsa::SigningKey::from(sk);
+            let sig: p224::ecdsa::Signature = signing_key.sign_prehash(&z)?;
+            Ok(p224::ecdsa::DerSignature::from(sig).as_bytes().to_vec())
         }
-        _ => anyhow::bail!("decrypt requires RSA key"),
+        LeafKey::Ec(cert::EcKey::P256(sk)) => {
+            let z = hash_with(digest, data)?;
+            let signing_key = p256::ecdsa::SigningKey::from(sk);
+            let sig: P256Signature = signing_key.sign_prehash(&z)?;
+            Ok(P256DerSignature::from(sig).as_bytes().to_vec())
+        }
+        LeafKey::Ec(cert::EcKey::P384(sk)) => {
+            let z = hash_with(digest, data)?;
+            let signing_key = p384::ecdsa::SigningKey::from(ecdsa::SigningKey::from(sk));
+            let sig: P384Signature = signing_key.sign_prehash(&z)?;
+            Ok(P384DerSignature::from(sig).as_bytes().to_vec())
+        }
+        LeafKey::Ec(cert::EcKey::P521(sk)) => {
+            let z = hash_with(digest, data)?;
+            let signing_key = p521::ecdsa::SigningKey::from(ecdsa::SigningKey::from(sk));
+            let sig: P521Signature = signing_key.sign_prehash(&z)?;
+            Ok(P521DerSignature::from(sig).as_bytes().to_vec())
+        }
+        LeafKey::Rsa(rk) => {
+            let rk = rk.as_ref().clone();
+            let z = hash_with(digest, data)?;
+            if up.contains("PSS") {
+                sign_rsa_pss(&rk, digest, &z)
+            } else if up.contains("NOPADDING") {
+                anyhow::bail!("RSA NoPadding signing is not supported by the server keybox layer");
+            } else {
+                sign_rsa_pkcs1(&rk, digest, &z)
+            }
+        }
+    }
+}
+
+fn sign_rsa_pkcs1(
+    rk: &RsaPrivateKey,
+    digest: LeafDigest,
+    hashed: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    use rsa::Pkcs1v15Sign;
+    let sig = match digest {
+        // Sha1 的 `AssociatedOid` 要 sha1 crate 的 oid feature（Cargo.toml 已开）。
+        LeafDigest::Sha1 => rk.sign(Pkcs1v15Sign::new::<Sha1>(), hashed),
+        LeafDigest::Sha224 => rk.sign(Pkcs1v15Sign::new::<sha2::Sha224>(), hashed),
+        LeafDigest::Sha256 => rk.sign(Pkcs1v15Sign::new::<Sha256>(), hashed),
+        LeafDigest::Sha384 => rk.sign(Pkcs1v15Sign::new::<sha2::Sha384>(), hashed),
+        LeafDigest::Sha512 => rk.sign(Pkcs1v15Sign::new::<sha2::Sha512>(), hashed),
+        // PKCS#1 v1.5 的 DigestInfo 必须标一个摘要；真机也不会用 NONE 走这条。
+        LeafDigest::None => rk.sign(Pkcs1v15Sign::new::<Sha256>(), hashed),
+    }?;
+    Ok(sig)
+}
+
+fn sign_rsa_pss(rk: &RsaPrivateKey, digest: LeafDigest, hashed: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use rsa::Pss;
+    let mut rng = rand::rngs::OsRng;
+    let sig = match digest {
+        LeafDigest::Sha1 => rk.sign_with_rng(&mut rng, Pss::new::<Sha1>(), hashed),
+        LeafDigest::Sha224 => rk.sign_with_rng(&mut rng, Pss::new::<sha2::Sha224>(), hashed),
+        LeafDigest::Sha384 => rk.sign_with_rng(&mut rng, Pss::new::<sha2::Sha384>(), hashed),
+        LeafDigest::Sha512 => rk.sign_with_rng(&mut rng, Pss::new::<sha2::Sha512>(), hashed),
+        LeafDigest::None | LeafDigest::Sha256 => {
+            rk.sign_with_rng(&mut rng, Pss::new::<Sha256>(), hashed)
+        }
+    }?;
+    Ok(sig)
+}
+
+/// 按请求的算法解密。`PKCS1` / `NoPadding` / `OAEP` 三种都要认：
+/// 以前只实现了 OAEP，于是 `RSA/ECB/PKCS1Padding` 这条在服务端 keybox 层
+/// 直接失败、被当成"本层不适用"，最后落到设备层报 `no key for alias`。
+fn decrypt_data(key: &LeafKey, data: &[u8], algorithm: &str) -> anyhow::Result<Vec<u8>> {
+    let up = algorithm.to_ascii_uppercase();
+    let LeafKey::Rsa(rk) = key else {
+        anyhow::bail!("decrypt requires RSA key");
+    };
+    let rk = rk.as_ref();
+    if up.contains("PKCS1") || up.contains("PKCS#1") {
+        return Ok(rk.decrypt(rsa::Pkcs1v15Encrypt, data)?);
+    }
+    if up.contains("NOPADDING") {
+        // 原始 RSA：m = c^d mod n，按模长补零输出。
+        use rsa::traits::{PrivateKeyParts, PublicKeyParts};
+        let n = rk.n();
+        let d = rk.d();
+        let c = rsa::BigUint::from_bytes_be(data);
+        let m = c.modpow(d, n);
+        let mut out = vec![0u8; rk.size()];
+        let bytes = m.to_bytes_be();
+        let offset = out.len().saturating_sub(bytes.len());
+        out[offset..].copy_from_slice(&bytes);
+        return Ok(out);
+    }
+    // OAEP：摘要与 MGF1 摘要可以不同（Java 的 OAEPWithSHA-256AndMGF1Padding 就是
+    // 摘要 SHA-256、MGF1 用 SHA-1）。按算法串里的两段分别取。
+    let digest = LeafDigest::from_algorithm(&up);
+    let mgf = if up.contains("MGF1-SHA1") {
+        LeafDigest::Sha1
+    } else {
+        LeafDigest::from_algorithm(up.split("MGF1").nth(1).unwrap_or(&up))
+    };
+    decrypt_oaep(rk, digest, mgf, data)
+}
+
+// 每档失败只盖写同一个 `last`、真正读在 match 之后，编译器会报 unused_assignments，
+// 这里就在函数上下方方便一下。
+#[allow(unused_assignments)]
+fn decrypt_oaep(
+    rk: &RsaPrivateKey,
+    digest: LeafDigest,
+    mgf: LeafDigest,
+    data: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    use rsa::Oaep;
+    // 宏体里直接写 `last` 会被宏卫生当成新绑定，所以只能拿参数把 slot 传进去。
+    macro_rules! try_scheme {
+        ($slot:ident, $d:ty, $m:ty) => {
+            match rk.decrypt(Oaep::new_with_mgf_hash::<$d, $m>(), data) {
+                Ok(out) => return Ok(out),
+                Err(e) => $slot = Some(anyhow::anyhow!("{e}")),
+            }
+        };
+    }
+    let mut last: Option<anyhow::Error> = None;
+    match (digest, mgf) {
+        (LeafDigest::Sha1, LeafDigest::Sha1) => try_scheme!(last, Sha1, Sha1),
+        (LeafDigest::Sha1, LeafDigest::Sha256) => try_scheme!(last, Sha1, Sha256),
+        (LeafDigest::Sha1, _) => try_scheme!(last, Sha1, Sha1),
+        (LeafDigest::Sha224, LeafDigest::Sha1) => try_scheme!(last, sha2::Sha224, Sha1),
+        (LeafDigest::Sha224, LeafDigest::Sha256) => try_scheme!(last, sha2::Sha224, Sha256),
+        (LeafDigest::Sha224, _) => try_scheme!(last, sha2::Sha224, Sha1),
+        (LeafDigest::Sha256, LeafDigest::Sha1) => try_scheme!(last, Sha256, Sha1),
+        (LeafDigest::Sha256, LeafDigest::Sha224) => try_scheme!(last, Sha256, sha2::Sha224),
+        (LeafDigest::Sha256, LeafDigest::Sha384) => try_scheme!(last, Sha256, sha2::Sha384),
+        (LeafDigest::Sha256, LeafDigest::Sha512) => try_scheme!(last, Sha256, sha2::Sha512),
+        (LeafDigest::Sha256, LeafDigest::Sha256) | (LeafDigest::Sha256, LeafDigest::None) => {
+            try_scheme!(last, Sha256, Sha256)
+        }
+        (LeafDigest::Sha384, LeafDigest::Sha1) => try_scheme!(last, sha2::Sha384, Sha1),
+        (LeafDigest::Sha384, LeafDigest::Sha384) => try_scheme!(last, sha2::Sha384, sha2::Sha384),
+        (LeafDigest::Sha384, _) => try_scheme!(last, sha2::Sha384, Sha256),
+        (LeafDigest::Sha512, LeafDigest::Sha1) => try_scheme!(last, sha2::Sha512, Sha1),
+        (LeafDigest::Sha512, LeafDigest::Sha512) => try_scheme!(last, sha2::Sha512, sha2::Sha512),
+        (LeafDigest::Sha512, _) => try_scheme!(last, sha2::Sha512, Sha256),
+        (LeafDigest::None, _) => try_scheme!(last, Sha256, Sha1),
+    }
+    // 老调用方没带算法串时按历史上能用的两种组合再兜一遍。
+    try_scheme!(last, Sha256, Sha256);
+    try_scheme!(last, Sha256, Sha1);
+    match last {
+        Some(e) => Err(anyhow::anyhow!("rsa oaep decrypt failed: {e}")),
+        None => Err(anyhow::anyhow!("rsa oaep decrypt failed")),
     }
 }
 
@@ -1672,5 +1899,78 @@ mod boot_value_tests {
         assert_ne!(a, boot_value_seed("device-b-y", "bootkey", "2026102903"));
         assert_ne!(a, boot_value_seed("device-b-x", "boothash", "2026102903"));
         assert_ne!(a, [0u8; 32]);
+    }
+}
+
+#[cfg(test)]
+mod layer_crypto_tests {
+    use super::*;
+
+    fn rsa_leaf() -> (RsaPrivateKey, LeafKey) {
+        let mut rng = rand::rngs::OsRng;
+        let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let leaf = LeafKey::Rsa(key.clone().into());
+        (key, leaf)
+    }
+
+    fn p256_leaf() -> (p256::SecretKey, LeafKey) {
+        let sk = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        (sk.clone(), LeafKey::Ec(cert::EcKey::P256(sk.clone())))
+    }
+
+    /// PKCS#1 v1.5 解密：以前这条完全没实现，`RSA/ECB/PKCS1Padding` 的请求在
+    /// 服务端 keybox 层直接失败、被当成"本层不适用"，最后落到设备层报 key_not_found。
+    #[test]
+    fn pkcs1_decrypt_round_trips() {
+        let (priv_key, leaf) = rsa_leaf();
+        let msg = b"ommega-pkcs1-check";
+        use rsa::traits::PublicKeyParts;
+        let pub_key = priv_key.to_public_key();
+        let enc = pub_key
+            .encrypt(&mut rand::rngs::OsRng, rsa::Pkcs1v15Encrypt, msg)
+            .expect("encrypt");
+        assert_eq!(enc.len(), priv_key.size());
+        let out = decrypt_data(&leaf, &enc, "RSA/ECB/PKCS1Padding").expect("pkcs1 decrypt");
+        assert_eq!(out, msg);
+    }
+
+    /// OAEP 仍然可用（摘要 SHA-256 + MGF1 SHA-1，Java 的老组合）。
+    #[test]
+    fn oaep_decrypt_still_works() {
+        let (priv_key, leaf) = rsa_leaf();
+        let msg = b"ommega-oaep-check";
+        let pub_key = priv_key.to_public_key();
+        let enc = pub_key
+            .encrypt(&mut rand::rngs::OsRng, rsa::Oaep::new::<Sha256>(), msg)
+            .expect("encrypt");
+        let out = decrypt_data(&leaf, &enc, "RSA/OAEP/SHA-256/MGF1-SHA256").expect("oaep decrypt");
+        assert_eq!(out, msg);
+    }
+
+    /// `NONEwithECDSA`：输入本身就是摘要，服务端必须直接签摘要，不能再哈希一层。
+    #[test]
+    fn raw_ecdsa_signs_the_digest_as_is() {
+        use ecdsa::signature::hazmat::PrehashVerifier as _;
+        let (sk, leaf) = p256_leaf();
+        let digest = [0x5au8; 32];
+        let sig = sign_data(&leaf, &digest, "NONEwithECDSA").expect("sign");
+        let verifier = *p256::ecdsa::SigningKey::from(&sk).verifying_key();
+        let sig = P256Signature::from_der(&sig).expect("der");
+        verifier
+            .verify_prehash(&digest, &sig)
+            .expect("NONEwithECDSA signature must verify against the raw digest");
+    }
+
+    /// SHA384withRSA：PKCS#1 的 DigestInfo 前缀必须跟着摘要走。
+    #[test]
+    fn sha384_rsa_signature_verifies() {
+        let (priv_key, leaf) = rsa_leaf();
+        let msg = b"ommega-sha384-check";
+        let sig = sign_data(&leaf, msg, "SHA384withRSA").expect("sign");
+        let hashed = sha2::Sha384::digest(msg);
+        priv_key
+            .to_public_key()
+            .verify(rsa::Pkcs1v15Sign::new::<sha2::Sha384>(), &hashed, &sig)
+            .expect("SHA384withRSA signature must verify");
     }
 }
